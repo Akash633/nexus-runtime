@@ -1,14 +1,13 @@
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.agents.registry import AgentRegistry
+from app.db.execution_history import ExecutionHistory
 from app.runtime.decision_engine import DecisionEngine
 from app.runtime.execution_engine import ExecutionEngine
 
-
-# ==========================================================
-# ROUTER
-# ==========================================================
 
 router = APIRouter(
     prefix="/agents",
@@ -16,16 +15,8 @@ router = APIRouter(
 )
 
 
-# ==========================================================
-# AGENT REGISTRY
-# ==========================================================
-
 registry = AgentRegistry()
 
-
-# ==========================================================
-# SAMPLE AI AGENTS
-# ==========================================================
 
 registry.register({
     "id": "gpt-agent",
@@ -35,6 +26,11 @@ registry.register({
         "coding",
         "reasoning"
     ],
+    "capability_scores": {
+        "text": 0.95,
+        "coding": 0.95,
+        "reasoning": 0.95
+    },
     "cost": 0.02,
     "latency": 200
 })
@@ -48,6 +44,11 @@ registry.register({
         "image",
         "reasoning"
     ],
+    "capability_scores": {
+        "text": 0.90,
+        "image": 0.98,
+        "reasoning": 0.90
+    },
     "cost": 0.01,
     "latency": 150
 })
@@ -61,23 +62,47 @@ registry.register({
         "coding",
         "reasoning"
     ],
+    "capability_scores": {
+        "text": 0.92,
+        "coding": 0.98,
+        "reasoning": 0.95
+    },
     "cost": 0.015,
     "latency": 180
 })
 
 
-# ==========================================================
-# ENGINES
-# ==========================================================
+registry.register({
+    "id": "groq-agent",
+    "name": "Groq Agent",
+    "capabilities": [
+        "text",
+        "coding",
+        "reasoning"
+    ],
+    "capability_scores": {
+        "text": 0.85,
+        "coding": 0.85,
+        "reasoning": 0.90
+    },
+    "cost": 0.0,
+    "latency": 50
+})
 
-decision_engine = DecisionEngine(registry)
 
-execution_engine = ExecutionEngine()
+execution_history = ExecutionHistory()
 
 
-# ==========================================================
-# REQUEST SCHEMAS
-# ==========================================================
+execution_engine = ExecutionEngine(
+    execution_history=execution_history
+)
+
+
+decision_engine = DecisionEngine(
+    registry,
+    execution_engine.latency_history
+)
+
 
 class AgentSelectionRequest(BaseModel):
     capability: str
@@ -86,17 +111,11 @@ class AgentSelectionRequest(BaseModel):
 class AgentExecutionRequest(BaseModel):
     capability: str
     task: str
+    simulate_failure_for: Optional[str] = None
 
-
-# ==========================================================
-# GET ALL AGENTS
-# ==========================================================
 
 @router.get("/")
 def get_agents():
-    """
-    Return all registered AI agents.
-    """
 
     agents = registry.get_all_agents()
 
@@ -106,17 +125,14 @@ def get_agents():
     }
 
 
-# ==========================================================
-# GET AGENTS BY CAPABILITY
-# ==========================================================
-
 @router.get("/capability/{capability}")
-def get_agents_by_capability(capability: str):
-    """
-    Return all agents that support a specific capability.
-    """
+def get_agents_by_capability(
+    capability: str
+):
 
-    agents = registry.find_by_capability(capability)
+    agents = registry.find_by_capability(
+        capability
+    )
 
     return {
         "capability": capability,
@@ -125,21 +141,17 @@ def get_agents_by_capability(capability: str):
     }
 
 
-# ==========================================================
-# SELECT BEST AGENT
-# ==========================================================
-
 @router.post("/select")
-def select_best_agent(request: AgentSelectionRequest):
-    """
-    Select the best available agent based on
-    capability, cost and latency.
-    """
+def select_best_agent(
+    request: AgentSelectionRequest
+):
 
     try:
 
-        selected_agent = decision_engine.select_agent(
-            request.capability
+        selected_agent = (
+            decision_engine.select_agent(
+                request.capability
+            )
         )
 
         return {
@@ -156,37 +168,64 @@ def select_best_agent(request: AgentSelectionRequest):
         )
 
 
-# ==========================================================
-# EXECUTE TASK
-# ==========================================================
-
 @router.post("/execute")
-def execute_agent(request: AgentExecutionRequest):
-    """
-    Select the best agent and execute the task.
-    """
+def execute_agent(
+    request: AgentExecutionRequest
+):
 
     try:
 
-        # --------------------------------------------------
-        # Step 1: Select the best agent
-        # --------------------------------------------------
-
-        selected_agent = decision_engine.select_agent(
-            request.capability
+        ranked_agents = (
+            decision_engine.rank_agents(
+                request.capability
+            )
         )
 
-        # --------------------------------------------------
-        # Step 2: Execute the task
-        # --------------------------------------------------
+        failed_agents = []
 
-        result = execution_engine.execute(
-            agent=selected_agent,
-            task=request.task,
-            capability=request.capability
+        for agent in ranked_agents:
+
+            try:
+
+                should_fail = (
+                    request.simulate_failure_for
+                    == agent.get("id")
+                )
+
+                result = execution_engine.execute(
+                    agent=agent,
+                    task=request.task,
+                    capability=request.capability,
+                    simulate_failure=should_fail
+                )
+
+                result["fallback_used"] = (
+                    len(failed_agents) > 0
+                )
+
+                if failed_agents:
+
+                    result["failed_agents"] = (
+                        failed_agents
+                    )
+
+                return result
+
+            except Exception as error:
+
+                failed_agents.append({
+                    "agent_id": agent.get("id"),
+                    "agent_name": agent.get("name"),
+                    "error": str(error)
+                })
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "All capable agents failed",
+                "failed_agents": failed_agents
+            }
         )
-
-        return result
 
     except ValueError as error:
 
@@ -194,6 +233,10 @@ def execute_agent(request: AgentExecutionRequest):
             status_code=404,
             detail=str(error)
         )
+
+    except HTTPException:
+
+        raise
 
     except Exception as error:
 
@@ -203,15 +246,19 @@ def execute_agent(request: AgentExecutionRequest):
         )
 
 
-# ==========================================================
-# AGENTS HEALTH CHECK
-# ==========================================================
+@router.get("/latency-history")
+def get_latency_history():
+
+    history = execution_history.get_all()
+
+    return {
+        "count": len(history),
+        "history": history
+    }
+
 
 @router.get("/health")
 def agents_health():
-    """
-    Check Agent Registry health.
-    """
 
     agents = registry.get_all_agents()
 
@@ -219,3 +266,40 @@ def agents_health():
         "status": "healthy",
         "registered_agents": len(agents)
     }
+
+
+@router.get("/performance")
+def get_agent_performance():
+
+    performance = (
+        execution_history.get_all_agent_stats()
+    )
+
+    return {
+        "count": len(performance),
+        "agents": performance
+    }
+
+
+@router.get("/performance/{agent_id}")
+def get_agent_agent_performance(
+    agent_id: str
+):
+
+    performance = (
+        execution_history.get_agent_stats(
+            agent_id
+        )
+    )
+
+    if performance["total_executions"] == 0:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No execution history found "
+                f"for agent: {agent_id}"
+            )
+        )
+
+    return performance
