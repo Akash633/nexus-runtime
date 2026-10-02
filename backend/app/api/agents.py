@@ -5,8 +5,10 @@ from pydantic import BaseModel
 
 from app.agents.registry import AgentRegistry
 from app.db.execution_history import ExecutionHistory
+from app.db.policy_storage import PolicyStorage
 from app.runtime.decision_engine import DecisionEngine
 from app.runtime.execution_engine import ExecutionEngine
+from app.runtime.policy_engine import PolicyEngine
 
 
 router = APIRouter(
@@ -14,6 +16,10 @@ router = APIRouter(
     tags=["Agents"]
 )
 
+
+# ============================================================
+# AGENT REGISTRY
+# ============================================================
 
 registry = AgentRegistry()
 
@@ -90,6 +96,10 @@ registry.register({
 })
 
 
+# ============================================================
+# EXECUTION HISTORY
+# ============================================================
+
 execution_history = ExecutionHistory()
 
 
@@ -98,11 +108,53 @@ execution_engine = ExecutionEngine(
 )
 
 
+# ============================================================
+# POLICY STORAGE
+# ============================================================
+
+policy_storage = PolicyStorage()
+
+
+# ============================================================
+# POLICY ENGINE
+# ============================================================
+
+policy_engine = PolicyEngine()
+
+
+# Load previously saved policy when the application starts.
+saved_policy = policy_storage.load_policy()
+
+
+if saved_policy is not None:
+
+    policy_engine.allowed_agents = (
+        saved_policy["hard"]["allowed_agents"]
+    )
+
+    policy_engine.blocked_agents = (
+        saved_policy["hard"]["blocked_agents"]
+    )
+
+    policy_engine.preferred_max_cost = (
+        saved_policy["soft"]["preferred_max_cost"]
+    )
+
+
+# ============================================================
+# DECISION ENGINE
+# ============================================================
+
 decision_engine = DecisionEngine(
-    registry,
-    execution_engine.latency_history
+    registry=registry,
+    latency_history=execution_engine.latency_history,
+    policy_engine=policy_engine
 )
 
+
+# ============================================================
+# REQUEST MODELS
+# ============================================================
 
 class AgentSelectionRequest(BaseModel):
     capability: str
@@ -113,6 +165,16 @@ class AgentExecutionRequest(BaseModel):
     task: str
     simulate_failure_for: Optional[str] = None
 
+
+class PolicyUpdateRequest(BaseModel):
+    allowed_agents: Optional[list[str]] = None
+    blocked_agents: Optional[list[str]] = None
+    preferred_max_cost: Optional[float] = None
+
+
+# ============================================================
+# AGENT APIs
+# ============================================================
 
 @router.get("/")
 def get_agents():
@@ -141,6 +203,94 @@ def get_agents_by_capability(
     }
 
 
+# ============================================================
+# POLICY APIs
+# ============================================================
+
+@router.get("/policy")
+def get_policy():
+
+    return {
+        "success": True,
+        "policy": policy_engine.get_policy()
+    }
+
+
+@router.put("/policy")
+def update_policy(
+    request: PolicyUpdateRequest
+):
+
+    # --------------------------------------------------------
+    # Update allowed agents
+    # --------------------------------------------------------
+
+    if "allowed_agents" in request.model_fields_set:
+
+        policy_engine.allowed_agents = (
+            request.allowed_agents
+            if request.allowed_agents is not None
+            else []
+        )
+
+
+    # --------------------------------------------------------
+    # Update blocked agents
+    # --------------------------------------------------------
+
+    if "blocked_agents" in request.model_fields_set:
+
+        policy_engine.blocked_agents = (
+            request.blocked_agents
+            if request.blocked_agents is not None
+            else []
+        )
+
+
+    # --------------------------------------------------------
+    # Update preferred maximum cost
+    # --------------------------------------------------------
+
+    if "preferred_max_cost" in request.model_fields_set:
+
+        if (
+            request.preferred_max_cost is not None
+            and request.preferred_max_cost < 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "preferred_max_cost "
+                    "cannot be negative"
+                )
+            )
+
+        # None means explicitly reset the preference.
+        policy_engine.preferred_max_cost = (
+            request.preferred_max_cost
+        )
+
+
+    # --------------------------------------------------------
+    # Save updated policy permanently
+    # --------------------------------------------------------
+
+    policy_storage.save_policy(
+        policy_engine.get_policy()
+    )
+
+
+    return {
+        "success": True,
+        "message": "Policy updated successfully",
+        "policy": policy_engine.get_policy()
+    }
+
+
+# ============================================================
+# AGENT SELECTION
+# ============================================================
+
 @router.post("/select")
 def select_best_agent(
     request: AgentSelectionRequest
@@ -167,6 +317,10 @@ def select_best_agent(
             detail=str(error)
         )
 
+
+# ============================================================
+# AGENT EXECUTION + FALLBACK
+# ============================================================
 
 @router.post("/execute")
 def execute_agent(
@@ -219,13 +373,18 @@ def execute_agent(
                     "error": str(error)
                 })
 
+
         raise HTTPException(
             status_code=503,
             detail={
-                "message": "All capable agents failed",
+                "message": (
+                    "All policy-approved "
+                    "agents failed"
+                ),
                 "failed_agents": failed_agents
             }
         )
+
 
     except ValueError as error:
 
@@ -234,9 +393,11 @@ def execute_agent(
             detail=str(error)
         )
 
+
     except HTTPException:
 
         raise
+
 
     except Exception as error:
 
@@ -245,6 +406,10 @@ def execute_agent(
             detail=f"Execution failed: {str(error)}"
         )
 
+
+# ============================================================
+# EXECUTION HISTORY
+# ============================================================
 
 @router.get("/latency-history")
 def get_latency_history():
@@ -257,6 +422,10 @@ def get_latency_history():
     }
 
 
+# ============================================================
+# HEALTH
+# ============================================================
+
 @router.get("/health")
 def agents_health():
 
@@ -267,6 +436,10 @@ def agents_health():
         "registered_agents": len(agents)
     }
 
+
+# ============================================================
+# PERFORMANCE
+# ============================================================
 
 @router.get("/performance")
 def get_agent_performance():

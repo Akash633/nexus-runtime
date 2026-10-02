@@ -1,6 +1,7 @@
 from typing import Dict, Any, List
 
 from app.agents.registry import AgentRegistry
+from app.runtime.policy_engine import PolicyEngine
 
 
 class DecisionEngine:
@@ -13,14 +14,21 @@ class DecisionEngine:
     - Actual / estimated latency
     - Historical success rate
 
-    The engine uses previous execution history to
-    improve future agent selection.
+    Before ranking, the Policy Engine evaluates each
+    candidate agent.
+
+    Hard policy violations remove an agent from
+    the candidate pool.
+
+    Soft policy effects are preserved as information
+    for the Decision Engine and future scoring logic.
     """
 
     def __init__(
         self,
         registry: AgentRegistry,
-        latency_history: List[Dict[str, Any]] | None = None
+        latency_history: List[Dict[str, Any]] | None = None,
+        policy_engine: PolicyEngine | None = None
     ):
         self.registry = registry
 
@@ -28,6 +36,12 @@ class DecisionEngine:
             latency_history
             if latency_history is not None
             else []
+        )
+
+        self.policy_engine = (
+            policy_engine
+            if policy_engine is not None
+            else PolicyEngine()
         )
 
     def get_actual_latency(
@@ -68,7 +82,6 @@ class DecisionEngine:
         ]
 
         if not agent_records:
-            # New agent gets neutral success rate.
             return 0.5
 
         successful_executions = sum(
@@ -121,12 +134,66 @@ class DecisionEngine:
             min(1.0, score)
         )
 
+    def get_policy_approved_agents(
+        self,
+        capability: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Get agents that satisfy all hard policies.
+
+        Soft policy effects are attached to each
+        approved agent but do not remove the agent.
+        """
+
+        capable_agents = self.registry.find_by_capability(
+            capability
+        )
+
+        if not capable_agents:
+            raise ValueError(
+                f"No agent available for capability: {capability}"
+            )
+
+        approved_agents = []
+
+        for agent in capable_agents:
+
+            policy_result = (
+                self.policy_engine.evaluate_agent(
+                    agent,
+                    capability
+                )
+            )
+
+            if not policy_result["allowed"]:
+                continue
+
+            agent["policy"] = {
+                "allowed": True,
+                "hard_policy_violations": [],
+                "soft_policy_effects": (
+                    policy_result[
+                        "soft_policy_effects"
+                    ]
+                )
+            }
+
+            approved_agents.append(agent)
+
+        if not approved_agents:
+            raise ValueError(
+                "No agent satisfies the active "
+                f"policies for capability: {capability}"
+            )
+
+        return approved_agents
+
     def rank_agents(
         self,
         capability: str
     ) -> List[Dict[str, Any]]:
         """
-        Rank all capable agents using adaptive scoring.
+        Rank policy-approved agents using adaptive scoring.
 
         Score components:
 
@@ -134,16 +201,18 @@ class DecisionEngine:
         Cost           : 28%
         Latency        : 20%
         Success Rate   : 22%
+
+        Hard policy violations are excluded before
+        scoring.
+
+        Soft policy effects are currently preserved
+        as metadata and will be incorporated into
+        adaptive scoring in a later step.
         """
 
-        agents = self.registry.find_by_capability(
+        agents = self.get_policy_approved_agents(
             capability
         )
-
-        if not agents:
-            raise ValueError(
-                f"No agent available for capability: {capability}"
-            )
 
         effective_latencies = []
 
@@ -281,7 +350,7 @@ class DecisionEngine:
             reverse=True
         )
 
-        # Remove internal fields
+        # Remove internal calculation fields
         for agent in agents:
 
             agent.pop(
@@ -306,7 +375,7 @@ class DecisionEngine:
         capability: str
     ) -> Dict[str, Any]:
         """
-        Select the highest-ranked agent.
+        Select the highest-ranked policy-approved agent.
         """
 
         ranked_agents = self.rank_agents(
